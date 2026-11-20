@@ -730,7 +730,7 @@ const PACKS = {
 };
 const TIMES = [20, 30, 45, 60], LIVES = [1, 2, 3, 5];
 const VT = window.FULL_ODDS_TEST || {};   // lets automated tests shorten the fuse; unused in normal play
-const FUSE_MIN = VT.fuseMin || 10000, FUSE_MAX = VT.fuseMax || 30000, FUSE_FLOOR = VT.floor || 8000, VS_INTRO = VT.intro || 4500, VS_FIRST = VT.first || 3000;
+const FUSE_MIN = VT.fuseMin || 10000, FUSE_MAX = VT.fuseMax || 30000, VS_INTRO = VT.intro || 4500, VS_FIRST = VT.first || 3000;
 const VS_GRACE = 4000, VS_GONE = 5000, LIFE_COST = 200, MAX_LIVES = 5, VS_MIN_ANS = 15;
 const A32 = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789', PACK_KEYS = ['all', 'pokedex', 'pokemon', 'moves', 'regions', 'abilities', 'trivia'];
 const READY_MS = 2400, GRACE_MS = 6000, AUTO_NEXT_MS = 16000, N_PROMPTS = 7, BLADES = 32;
@@ -1108,7 +1108,8 @@ function nextLocal() {
 
 // ---------- versus: pass the Flame Orb ----------
 // One prompt at a time. Whoever holds the orb names an answer nobody has used this round, which passes it on.
-// A hidden fuse of 10 to 30 seconds keeps burning as the orb moves, and whoever holds it at zero loses a life.
+// Each round has one hidden fuse length, 10 to 30 seconds. Every pass resets the orb to that full length, and
+// whoever lets it run down to zero loses a life.
 // The holder's own screen keeps the time for their turn, so nobody needs a synchronised clock.
 function fuseFor(seed, k) { const r = mulberry32(hashStr(seed + '|fuse|' + k))(); return Math.round((FUSE_MIN + r * (FUSE_MAX - FUSE_MIN)) / 100) * 100; }
 function validV(v) {
@@ -1123,21 +1124,21 @@ function vsInit(players, lives, seed) {
   players.forEach(p => { nm[p.pid] = p.nm; lv[p.pid] = lives; ch[p.pid] = 0; st[p.pid] = [0, 0, 0]; });
   return { k: 0, np: 0, hp: ord[Math.floor(mulberry32(hashStr(seed + '|first'))() * ord.length)], fl: fuseFor(seed, 0), ord, nm, lv, ch, st, u: [], last: null, win: null, over: 0 };
 }
-function vsPassState(v, a, tier, elapsed) {
+function vsPassState(v, a, tier) {
   const p = v.hp, ch = { ...v.ch }, lv = { ...v.lv }, st = { ...v.st };
   let c = (ch[p] || 0) + TIERS[tier].pts, extra = 0;
   if (c >= LIFE_COST) { if (lv[p] < MAX_LIVES) { c -= LIFE_COST; lv[p]++; extra = 1; } else c = LIFE_COST; }
   ch[p] = c; st[p] = [st[p][0] + 1, Math.max(st[p][1], tier), st[p][2] + extra];
-  // the fuse carries over to the next player, but never with less than the floor
-  return { ...v, hp: vsNext(v, p) || p, fl: Math.max(FUSE_FLOOR, Math.round(v.fl - elapsed)), np: v.np + 1, ch, lv, st, u: [...v.u, [v.ord.indexOf(p), a]] };
+  // v.fl is this round's fuse length and is left alone, so the next player starts with a full fuse
+  return { ...v, hp: vsNext(v, p) || p, np: v.np + 1, ch, lv, st, u: [...v.u, [v.ord.indexOf(p), a]] };
 }
-// left === undefined: the fuse ran out on the holder. Otherwise the holder has gone and the orb moves on with what is left.
-function vsOutState(v, seed, left) {
-  const p = v.hp, lv = { ...v.lv }, gone = left !== undefined; lv[p] = gone ? 0 : Math.max(0, lv[p] - 1);
+// gone = false: the fuse ran out on the holder. gone = true: the holder has left and the orb moves on with a full fuse.
+function vsOutState(v, seed, gone) {
+  const p = v.hp, lv = { ...v.lv }; lv[p] = gone ? 0 : Math.max(0, lv[p] - 1);
   const base = { ...v, lv, np: v.np + 1, last: { t: gone ? 'left' : 'burn', p, k: v.k, lv: lv[p] } };
   const alive = v.ord.filter(x => lv[x] > 0);
   if (!alive.length || (v.ord.length > 1 && alive.length === 1)) return { ...base, win: v.ord.length > 1 ? alive[0] || null : null, over: 1 };
-  if (gone) return { ...base, hp: vsNext(base, p), fl: Math.max(FUSE_FLOOR, Math.round(left)) };
+  if (gone) return { ...base, hp: vsNext(base, p) };
   return { ...base, k: v.k + 1, hp: vsNext(base, p) || p, fl: fuseFor(seed, v.k + 1), u: [] };
 }
 function VS() {
@@ -1169,7 +1170,7 @@ function tickVersus() {
       const others = roomPeers(S.online.code).map(p => p.presence.pid), here = others.includes(v.hp);
       S.vs.goneAt = here ? 0 : (S.vs.goneAt || now);
       const wait = [S.pid, ...others].filter(p => p !== v.hp).sort()[0] === S.pid ? 0 : 3000;
-      if (S.vs.goneAt && now - S.vs.goneAt > VS_GONE + wait) { S.vs.sent = true; s.commit(vsOutState(v, s.seed, left)); return; }
+      if (S.vs.goneAt && now - S.vs.goneAt > VS_GONE + wait) { S.vs.sent = true; s.commit(vsOutState(v, s.seed, true)); return; }
       if (left < -(VS_GRACE + wait)) { S.vs.sent = true; s.commit(vsOutState(v, s.seed)); return; }
     }
   }
@@ -1182,13 +1183,14 @@ function answerMsg(p, res, typed) {
 }
 function vsSubmit() {
   const s = VS(), inp = $('#vs-input'); if (!s || !inp || inp.disabled || !S.vs || S.vs.sent || s.v.over) return;
-  const v = s.v, now = Date.now(), fb = $('#feedback'); if (!s.mine(v.hp) || now < S.vs.t0) return;
+  const v = s.v, now = Date.now(), fb = $('#feedback');
+  if (!s.mine(v.hp) || now < S.vs.t0) { fb.textContent = 'Hold that thought. You can send it when the orb reaches you.'; fb.dataset.hold = '1'; return; }
   const p = vsPrompt(s), res = judge(p, inp.value);
-  const nope = msg => { fb.textContent = msg; inp.classList.remove('shake'); void inp.offsetWidth; inp.classList.add('shake'); inp.select(); };
+  const nope = msg => { fb.textContent = msg; fb.dataset.hold = ''; inp.classList.remove('shake'); void inp.offsetWidth; inp.classList.add('shake'); inp.select(); };
   if (!res.ok) return nope(answerMsg(p, res, inp.value.trim().slice(0, 30)));
   if (v.u.some(x => x[1] === res.a)) return nope(res.name + ' has already been said this round. Try another.');
   S.vs.sent = true; inp.value = ''; fb.textContent = '';
-  s.commit(vsPassState(v, res.a, res.tier, Math.max(0, now - S.vs.t0)));
+  s.commit(vsPassState(v, res.a, res.tier));
 }
 function vVersus() {
   const s = VS(); if (!s) return vHome();
@@ -1205,7 +1207,7 @@ function vVersus() {
   <div class="orbrow"><div class="orb" id="orb" data-heat="0" aria-hidden="true"></div><p class="orbline" id="orb-line" aria-live="polite"></p></div>
   <form class="answer" data-form="vs-answer" id="vs-form">
     <label class="vh" for="vs-input">Your answer</label>
-    <input class="field" id="vs-input" maxlength="40" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" enterkeyhint="go" placeholder="Name one to pass the orb" disabled>
+    <input class="field" id="vs-input" maxlength="40" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" enterkeyhint="go" placeholder="Type ahead for your turn">
     <button class="btn" id="vs-btn" disabled>Pass it on</button>
   </form>
   <p class="feedback" id="feedback" aria-live="polite"></p>
@@ -1231,7 +1233,15 @@ function refreshVersus(force) {
   $('#orb-line').textContent = intro ? (s.online && mine ? 'You start with the Flame Orb.' : nameOf(v.hp) + ' starts with the Flame Orb.')
     : s.online ? (mine ? 'You have the Flame Orb. Name one and pass it on.' : !v.ord.includes(S.pid) ? nameOf(v.hp) + ' has the Flame Orb. You are watching this game.' : v.lv[S.pid] > 0 ? nameOf(v.hp) + ' has the Flame Orb.' : nameOf(v.hp) + ' has the Flame Orb. You are out and watching.')
       : nameOf(v.hp) + ' has the Flame Orb. Name one, then pass the screen.';
-  if (inp.disabled === can) { inp.disabled = !can; $('#vs-btn').disabled = !can; if (can) inp.focus({ preventScroll: true }); }
+  // Players still in the game keep a live, focused box the whole time so they can type ahead; only sending waits for the orb.
+  const playing = !v.over && (s.online ? v.ord.includes(S.pid) && v.lv[S.pid] > 0 : true), fb = $('#feedback');
+  inp.disabled = !playing; $('#vs-btn').disabled = !can;
+  const ph = !playing ? 'Watching' : can ? 'Name one to pass the orb' : 'Type ahead for your turn'; if (inp.placeholder !== ph) inp.placeholder = ph;
+  if (playing && (inp.dataset.seen !== '1' || (can && inp.dataset.turn !== S.vs.key))) {      // once when the screen is drawn, and again when the orb arrives
+    inp.dataset.seen = '1'; if (can) inp.dataset.turn = S.vs.key;
+    if (document.activeElement !== inp) inp.focus({ preventScroll: true });
+  }
+  if (can && fb.dataset.hold === '1') { fb.textContent = ''; fb.dataset.hold = ''; }
   const left = v.fl - (now - S.vs.t0), orb = $('#orb');
   orb.dataset.heat = intro || left > 10000 ? '0' : left > 4500 ? '1' : '2'; orb.classList.toggle('mine', mine && !intro);
 }
@@ -1354,7 +1364,7 @@ function vHome() {
       <li>Seven prompts. Type one answer before the grass is cut. A wrong guess costs time and nothing else.</li>
       <li>Each answer lands on one of six tiers, from Route 1 for 10 points to Full Odds for 100.</li>
       <li>Co-op with friends: everyone answers the same seven prompts for one team total, and two players giving the same answer both score half.</li>
-      <li>Versus with friends: pass the Flame Orb. Name an answer nobody has used to pass it on before its hidden fuse runs out. Lose all your lives and you are out.</li>
+      <li>Versus with friends: pass the Flame Orb. Name an answer nobody has used to pass it on. Every pass resets its hidden fuse, and letting it run out costs a life. Lose them all and you are out.</li>
       <li>Rooms are live. Everyone sees the same prompt and each answer the moment it lands.</li>
       <li>Regional forms count for type, stat and Ability prompts. Mega Evolutions and Gigantamax forms do not.</li>
       <li>Rarity is an editor's estimate of how quickly an answer comes to mind. It is not built from player statistics.</li>
@@ -1389,7 +1399,7 @@ function refreshHome() {
 }
 const MODE_HELP = {
   coop: 'Co-op: seven prompts and one team total. Spread out, because two matching answers both score half.',
-  versus: 'Versus: pass the Flame Orb. Name an answer nobody has used this round to pass it on. Its hidden fuse burns for 10 to 30 seconds, and whoever holds it at zero loses a life. Rare answers charge up an extra life. Last trainer standing wins.',
+  versus: 'Versus: pass the Flame Orb. Name an answer nobody has used this round to pass it on. Its hidden fuse lasts 10 to 30 seconds and resets with every pass. Let it run out and you lose a life. Rare answers charge up an extra life. Last trainer standing wins.',
 };
 function settingsHTML(cfg, withMode) {
   return `<div class="settings">
@@ -1632,6 +1642,8 @@ function start() {
   const app = $('#app');
   app.addEventListener('click', e => { const b = e.target.closest('[data-act]'); if (!b || b.disabled) return; const f = ACT[b.dataset.act]; if (f) f(b, e); });
   app.addEventListener('submit', e => { e.preventDefault(); const k = e.target.dataset.form; if (k === 'answer') submitAnswer(); else if (k === 'vs-answer') vsSubmit(); else if (k === 'join') enterRoom($('#join-code').value); });
+  // Enter does nothing by itself while the send button is off, so say why instead of looking broken
+  app.addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.id === 'vs-input' && $('#vs-btn').disabled) { e.preventDefault(); vsSubmit(); } });
   app.addEventListener('change', e => { const k = e.target.dataset.change; if (k && CHANGE[k]) CHANGE[k](e.target); });
   app.addEventListener('input', e => {
     if (e.target.id === 'name-input') { S.name = cleanName(e.target.value); keep.set('fo-name', S.name); S.joinMsg = ''; if (Net.mine.nm !== (S.name || null)) setPresence({ nm: S.name || null }); save(); }
